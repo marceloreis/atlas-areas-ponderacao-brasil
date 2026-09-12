@@ -1,0 +1,490 @@
+diff --git a/README.md b/README.md
+index c96e354..d130af4 100644
+--- a/README.md
++++ b/README.md
+@@ -1,11 +1,12 @@
+-# Atlas das Áreas de Ponderação — Brasil
++# Atlas das Áreas de Ponderação — Brasil · versão GeoJSON multinível
+ 
+ Mapa interativo nacional das Áreas de Ponderação do Censo Demográfico 2022. O projeto é independente da versão do estado de São Paulo e usa:
+ 
+ - renderizador cartográfico Canvas incorporado ao próprio site, sem dependências externas de JavaScript;
+-- GeoJSON nacional leve em pontos para a abertura e 27 arquivos detalhados, um por UF;
++- três GeoJSON nacionais topologicamente contínuos, com níveis nacional, regional e local;
++- troca atômica do nível de detalhe conforme o zoom, mantendo a malha anterior visível durante o carregamento;
+ - 31 arquivos JSON tabulares carregados sob demanda;
+-- Stamen Toner Lite, fornecido pela Stadia Maps, como mapa-base.
++- OpenStreetMap em segundo plano, sem recortar ou tilear a camada temática.
+ 
+ ## Base de dados
+ 
+@@ -27,9 +28,10 @@ dist/
+   app.js
+   styles.css
+   data/
+-    geojson/overview.geojson
+-    geojson/{codigo_uf}.geojson
+-    geojson/manifest.json
++    lod/nacional.geojson.gz
++    lod/regional.geojson.gz
++    lod/detalhado.geojson.gz
++    lod/manifest.json
+     areas.json
+     metadata.json
+     tables/*.json
+@@ -42,15 +44,15 @@ scripts/
+ 
+ ## Reconstrução dos dados
+ 
+-Os scripts não incorporam o GeoPackage nem as planilhas de origem. Para reconstruir os ativos, instale `openpyxl`, `shapely`, `mercantile`, `mapbox-vector-tile` e `pmtiles`, extraia os 31 XLSX em uma pasta e execute:
++Os três níveis devem ser derivados da mesma topologia, conservar os 14.406 códigos `cd_apond` e passar pela validação de cobertura antes da publicação. A simplificação nunca deve ser aplicada separadamente a cada polígono.
+ 
+-```bash
+-python scripts/build_data.py /caminho/APONDs2022_Brasil.gpkg /caminho/xlsx dist/data
+-python scripts/build_pmtiles.py /caminho/APONDs2022_Brasil.gpkg dist/data/data-index.json /tmp/aponds-br.pmtiles --maxzoom 10
+-python scripts/split_pmtiles.py /tmp/aponds-br.pmtiles dist/data/areas.json /tmp/aponds-regioes
+-node scripts/build_geojson_from_pmtiles.mjs /tmp/aponds-regioes dist/data/geojson 6 0.025
+-node scripts/build_overview_points.mjs
+-```
++| Nível | Entrada no zoom | Feições | Vértices | Tamanho |
++| --- | ---: | ---: | ---: | ---: |
++| Nacional | 0 | 14.406 | 453.930 | 12,1 MB |
++| Regional | 4,8 | 14.406 | 1.280.023 | 31,4 MB |
++| Detalhado | 7,8 | 14.406 | 3.176.731 | 76,0 MB |
++
++Todos os níveis foram validados como coberturas topológicas, sem geometrias vazias ou inválidas. A compactação gzip reduz a transferência sem alterar qualquer coordenada; a descompactação acontece no navegador. As faixas de saída usam uma margem de 0,4 ponto de zoom para evitar trocas repetidas junto aos limiares.
+ 
+ ## Execução local
+ 
+@@ -62,12 +64,6 @@ python -m http.server 8000 --directory dist
+ 
+ Depois acesse `http://localhost:8000`.
+ 
+-## GitHub Pages
+-
+-O site é publicado automaticamente a partir da pasta `dist` pelo fluxo `pages.yml`. Antes de publicar uma reconstrução completa dos dados, execute:
+-
+-```bash
+-python scripts/compress_web_data.py
+-```
++## Publicação
+ 
+-Endereço esperado: `https://marceloreis.github.io/atlas-areas-ponderacao-brasil/`.
++Este diretório é uma alternativa independente. Ele não substitui nem altera a versão principal do atlas. A pasta `dist` contém integralmente o site estático.
+diff --git a/dist/app.js b/dist/app.js
+index dcc73e5..611a452 100644
+--- a/dist/app.js
++++ b/dist/app.js
+@@ -1,4 +1,4 @@
+-import { AtlasMap } from "./atlas-map.js?v=2";
++import { AtlasMap } from "./atlas-map.js?v=3";
+ 
+ const palette = ["#ffffb2", "#fecc5c", "#fd8d3c", "#f03b20", "#bd0026"];
+ const nullColor = "#dce3e8";
+@@ -41,7 +41,6 @@ const state = {
+   selectedArea: null,
+   mapLoaded: false,
+   dataReady: false,
+-  loadedGeoKeys: new Set(["overview"]),
+   tonerErrors: 0,
+   geojsonErrors: 0,
+   toastTimer: null,
+@@ -562,14 +561,19 @@ function updateUrl() {
+ 
+ function initializeMap() {
+   state.map = new AtlasMap(document.getElementById("map"), state.geoManifest, {
+-    onClick: (geomIndex) => {
+-      const area = state.areasByGeomIndex.get(Number(geomIndex));
++    onClick: (areaCode) => {
++      const area = state.areasByCode.get(String(areaCode));
+       if (area) selectArea(area, false);
+     },
+-    onStateLoad: (key) => state.loadedGeoKeys.add(key),
+-    onStateError: (error) => {
++    onLevelPending: (info) => {
++      elements.mapBaseNote.textContent = `Preparando ${info.label.toLocaleLowerCase("pt-BR")}…`;
++    },
++    onLevelLoad: (info) => {
++      elements.mapBaseNote.textContent = `${info.label} · mapa-base OSM`;
++    },
++    onLevelError: (error) => {
+       console.error(error);
+-      if (state.geojsonErrors++ === 0) showToast("Não foi possível carregar uma das UFs. Tente aproximar novamente.");
++      if (state.geojsonErrors++ === 0) showToast("Não foi possível carregar o próximo nível de detalhe. A malha atual foi preservada.");
+     },
+   });
+   state.map.ready.then(() => {
+@@ -636,7 +640,7 @@ async function start() {
+   bindEvents();
+   try {
+     const areaPayloadPromise = fetchJson("./data/areas.json");
+-    const geoManifestPromise = fetchJson("./data/geojson/manifest.json");
++    const geoManifestPromise = fetchJson("./data/lod/manifest.json");
+     elements.loadingMessage.textContent = "Carregando catálogo de indicadores…";
+     const [metadata, geoManifest] = await Promise.all([
+       fetchJson("./data/metadata.json"),
+@@ -663,6 +667,7 @@ async function start() {
+     state.areas = hydrateAreas(areaPayload);
+     state.areasByGeomIndex = new Map(state.areas.map((area) => [area.geomIndex, area]));
+     state.areasByCode = new Map(state.areas.map((area) => [area.code, area]));
++    state.map.setAreaLookup(state.areasByCode);
+     elements.areaCount.textContent = numberInteger.format(state.areas.length);
+     state.currentTable = state.tableCache.get(state.currentGroupId);
+     state.dataReady = true;
+diff --git a/dist/atlas-map.js b/dist/atlas-map.js
+index 3c93467..f2e04fb 100644
+--- a/dist/atlas-map.js
++++ b/dist/atlas-map.js
+@@ -32,12 +32,25 @@ function pointInRing(point, ring) {
+ }
+ 
+ function pointInGeometry(point, geometry) {
+-  return geometry.coordinates.some((polygon) => {
++  const polygons = geometry.type === "Polygon" ? [geometry.coordinates] : geometry.coordinates;
++  return polygons.some((polygon) => {
+     if (!polygon.length || !pointInRing(point, polygon[0])) return false;
+     return !polygon.slice(1).some((hole) => pointInRing(point, hole));
+   });
+ }
+ 
++function geometryBounds(geometry) {
++  const polygons = geometry.type === "Polygon" ? [geometry.coordinates] : geometry.coordinates;
++  const bounds = [Infinity, Infinity, -Infinity, -Infinity];
++  for (const polygon of polygons) for (const ring of polygon) for (const coordinate of ring) {
++    bounds[0] = Math.min(bounds[0], coordinate[0]);
++    bounds[1] = Math.min(bounds[1], coordinate[1]);
++    bounds[2] = Math.max(bounds[2], coordinate[0]);
++    bounds[3] = Math.max(bounds[3], coordinate[1]);
++  }
++  return bounds;
++}
++
+ export class AtlasMap {
+   constructor(container, manifest, options = {}) {
+     this.container = container;
+@@ -47,9 +60,10 @@ export class AtlasMap {
+     this.zoom = 3.25;
+     this.colors = [];
+     this.selectedIndex = -1;
+-    this.overview = [];
+-    this.states = new Map();
+-    this.pendingStates = new Set();
++    this.activeLevel = null;
++    this.pendingLevel = null;
++    this.areasByCode = new Map();
++    this.drawFrame = null;
+     this.tiles = new Map();
+     this.drag = null;
+     this.canvas = document.createElement("canvas");
+@@ -63,14 +77,74 @@ export class AtlasMap {
+     this.resizeObserver = new ResizeObserver(() => this.resize());
+     this.resizeObserver.observe(this.container);
+     this.resize();
+-    this.ready = this.loadOverview();
++    this.ready = this.loadLevel("nacional", true);
++  }
++
++  levelInfo(key) {
++    return this.manifest.levels.find((level) => level.key === key);
++  }
++
++  desiredLevelKey() {
++    const current = this.activeLevel?.key;
++    if (current === "detalhado") {
++      if (this.zoom >= 7.4) return "detalhado";
++      if (this.zoom >= 4.4) return "regional";
++      return "nacional";
++    }
++    if (current === "regional") {
++      if (this.zoom >= 7.8) return "detalhado";
++      if (this.zoom >= 4.4) return "regional";
++      return "nacional";
++    }
++    if (this.zoom >= 7.8) return "detalhado";
++    if (this.zoom >= 4.8) return "regional";
++    return "nacional";
+   }
+ 
+-  async loadOverview() {
+-    const response = await fetch(new URL(this.manifest.overview, document.baseURI));
+-    if (!response.ok) throw new Error(`Visão nacional: ${response.status}`);
+-    this.overview = (await response.json()).features;
+-    this.draw();
++  async loadLevel(key, initial = false) {
++    if (this.activeLevel?.key === key) return this.activeLevel;
++    if (this.pendingLevel?.key === key) return this.pendingLevel.promise;
++    this.pendingLevel?.controller.abort();
++    const info = this.levelInfo(key);
++    const controller = new AbortController();
++    this.options.onLevelPending?.(info);
++    const promise = fetch(new URL(info.file, document.baseURI), { signal: controller.signal })
++      .then((response) => {
++        if (!response.ok) throw new Error(`${info.label}: ${response.status}`);
++        if (response.headers.get("content-encoding") === "gzip") return response.json();
++        if (!("DecompressionStream" in window)) {
++          throw new Error("Este navegador não oferece descompactação nativa de GeoJSON.");
++        }
++        const stream = response.body.pipeThrough(new DecompressionStream("gzip"));
++        return new Response(stream).json();
++      })
++      .then((payload) => payload.features.map((feature) => ({
++        ...feature,
++        properties: { c: String(feature.properties.c) },
++        _bounds: geometryBounds(feature.geometry),
++      })))
++      .then((features) => {
++        if (!initial && this.desiredLevelKey() !== key) return this.activeLevel;
++        this.activeLevel = { key, info, features };
++        this.pendingLevel = null;
++        this.options.onLevelLoad?.(info);
++        this.requestDraw();
++        return this.activeLevel;
++      })
++      .catch((error) => {
++        if (error.name === "AbortError") return this.activeLevel;
++        this.pendingLevel = null;
++        this.options.onLevelError?.(error, info);
++        if (initial) throw error;
++        return this.activeLevel;
++      });
++    this.pendingLevel = { key, controller, promise };
++    return promise;
++  }
++
++  ensureDetailLevel() {
++    const key = this.desiredLevelKey();
++    if (key !== this.activeLevel?.key) this.loadLevel(key);
+   }
+ 
+   addNavigation() {
+@@ -118,7 +192,7 @@ export class AtlasMap {
+       const moved = this.drag.moved;
+       this.drag = null;
+       this.canvas.classList.remove("is-dragging");
+-      this.ensureVisibleStates();
++      this.ensureDetailLevel();
+       if (!moved) this.handleClick(event);
+     };
+     this.canvas.addEventListener("pointerup", finish);
+@@ -136,7 +210,15 @@ export class AtlasMap {
+     this.canvas.height = Math.round(this.height * this.pixelRatio);
+     this.canvas.style.width = `${this.width}px`;
+     this.canvas.style.height = `${this.height}px`;
+-    this.draw();
++    this.requestDraw();
++  }
++
++  requestDraw() {
++    if (this.drawFrame) return;
++    this.drawFrame = requestAnimationFrame(() => {
++      this.drawFrame = null;
++      this.draw();
++    });
+   }
+ 
+   project(coordinate) {
+@@ -163,8 +245,8 @@ export class AtlasMap {
+ 
+   changed(loadStates = true) {
+     this.center[1] = clamp(this.center[1], -42, 14);
+-    this.draw();
+-    if (loadStates) this.ensureVisibleStates();
++    this.requestDraw();
++    if (loadStates) this.ensureDetailLevel();
+   }
+ 
+   fitBounds(bounds, options = {}) {
+@@ -178,11 +260,13 @@ export class AtlasMap {
+     this.changed();
+   }
+ 
+-  setColors(colors) { this.colors = colors; this.draw(); }
+-  select(geomIndex) { this.selectedIndex = geomIndex; this.draw(); }
++  setAreaLookup(areasByCode) { this.areasByCode = areasByCode; this.requestDraw(); }
++  setColors(colors) { this.colors = colors; this.requestDraw(); }
++  select(geomIndex) { this.selectedIndex = geomIndex; this.requestDraw(); }
+ 
+   featureColor(feature) {
+-    return feature.properties.h && this.colors[feature.properties.d] ? this.colors[feature.properties.d] : "#dce3e8";
++    const area = this.areasByCode.get(feature.properties.c);
++    return area && area.dataIndex >= 0 && this.colors[area.dataIndex] ? this.colors[area.dataIndex] : "#dce3e8";
+   }
+ 
+   draw() {
+@@ -193,8 +277,7 @@ export class AtlasMap {
+     ctx.fillRect(0, 0, this.width, this.height);
+     this.drawTiles(ctx);
+     this.drawGraticule(ctx);
+-    if (this.zoom < 6.2) this.drawOverview(ctx);
+-    if (this.zoom >= 5.5) this.drawStates(ctx);
++    this.drawAreas(ctx);
+   }
+ 
+   drawTiles(ctx) {
+@@ -222,7 +305,7 @@ export class AtlasMap {
+         const image = new Image();
+         tile = { image, loaded: false, fallback: false };
+         this.tiles.set(key, tile);
+-        image.onload = () => { tile.loaded = true; this.draw(); };
++        image.onload = () => { tile.loaded = true; this.requestDraw(); };
+         image.onerror = () => {
+           if (tile.fallback) return;
+           tile.fallback = true;
+@@ -260,23 +343,10 @@ export class AtlasMap {
+     ctx.restore();
+   }
+ 
+-  drawOverview(ctx) {
+-    const radius = 2.1 + (this.zoom - MIN_ZOOM) / (5.5 - MIN_ZOOM) * 2.3;
+-    for (const feature of this.overview) {
+-      const point = this.project(feature.geometry.coordinates);
+-      if (point[0] < -8 || point[1] < -8 || point[0] > this.width + 8 || point[1] > this.height + 8) continue;
+-      ctx.beginPath(); ctx.arc(point[0], point[1], radius, 0, Math.PI * 2);
+-      ctx.fillStyle = this.featureColor(feature); ctx.globalAlpha = 0.8; ctx.fill();
+-      if (feature.properties.g === this.selectedIndex) {
+-        ctx.globalAlpha = 1; ctx.strokeStyle = "#15263d"; ctx.lineWidth = 2.5; ctx.stroke();
+-      }
+-    }
+-    ctx.globalAlpha = 1;
+-  }
+-
+   traceGeometry(ctx, geometry) {
+     ctx.beginPath();
+-    for (const polygon of geometry.coordinates) for (const ring of polygon) {
++    const polygons = geometry.type === "Polygon" ? [geometry.coordinates] : geometry.coordinates;
++    for (const polygon of polygons) for (const ring of polygon) {
+       ring.forEach((coordinate, index) => {
+         const point = this.project(coordinate);
+         if (index === 0) ctx.moveTo(...point); else ctx.lineTo(...point);
+@@ -285,57 +355,29 @@ export class AtlasMap {
+     }
+   }
+ 
+-  drawStates(ctx) {
++  drawAreas(ctx) {
++    if (!this.activeLevel) return;
+     const view = this.getBounds();
+-    for (const { info, features } of this.states.values()) {
+-      if (!intersects(view, info.bounds)) continue;
+-      for (const feature of features) {
+-        this.traceGeometry(ctx, feature.geometry);
+-        ctx.fillStyle = this.featureColor(feature); ctx.globalAlpha = 0.96; ctx.fill("evenodd");
+-        ctx.globalAlpha = 1;
+-        ctx.strokeStyle = feature.properties.g === this.selectedIndex ? "#15263d" : "rgba(255,255,255,.58)";
+-        ctx.lineWidth = feature.properties.g === this.selectedIndex ? 2.7 : Math.max(0.25, (this.zoom - 3) * 0.12);
+-        ctx.stroke();
+-      }
+-    }
+-  }
+-
+-  async ensureVisibleStates() {
+-    if (this.zoom < 5.35) return;
+-    const view = this.getBounds();
+-    for (const info of this.manifest.states) {
+-      const key = `uf-${info.code}`;
+-      if (!intersects(view, info.bounds) || this.states.has(key) || this.pendingStates.has(key)) continue;
+-      this.pendingStates.add(key);
+-      try {
+-        const response = await fetch(new URL(info.file, document.baseURI));
+-        if (!response.ok) throw new Error(`${info.name}: ${response.status}`);
+-        this.states.set(key, { info, features: (await response.json()).features });
+-        this.options.onStateLoad?.(key);
+-        this.draw();
+-      } catch (error) {
+-        this.options.onStateError?.(error);
+-      } finally {
+-        this.pendingStates.delete(key);
+-      }
++    for (const feature of this.activeLevel.features) {
++      if (!intersects(view, feature._bounds)) continue;
++      this.traceGeometry(ctx, feature.geometry);
++      ctx.fillStyle = this.featureColor(feature); ctx.globalAlpha = 0.96; ctx.fill("evenodd");
++      const area = this.areasByCode.get(feature.properties.c);
++      ctx.globalAlpha = 1;
++      ctx.strokeStyle = area?.geomIndex === this.selectedIndex ? "#15263d" : "rgba(255,255,255,.58)";
++      ctx.lineWidth = area?.geomIndex === this.selectedIndex ? 2.7 : Math.max(0.25, (this.zoom - 3) * 0.12);
++      ctx.stroke();
+     }
+   }
+ 
+   hitTest(screen) {
+-    if (this.zoom < 5.5) {
+-      let closest = null;
+-      let distance = 42;
+-      for (const feature of this.overview) {
+-        const point = this.project(feature.geometry.coordinates);
+-        const squared = (point[0] - screen[0]) ** 2 + (point[1] - screen[1]) ** 2;
+-        if (squared < distance) { distance = squared; closest = feature; }
+-      }
+-      return closest?.properties.g ?? null;
+-    }
++    if (!this.activeLevel) return null;
+     const coordinate = this.unproject(screen);
+-    for (const { info, features } of [...this.states.values()].reverse()) {
+-      if (!intersects(this.getBounds(), info.bounds)) continue;
+-      for (const feature of features) if (pointInGeometry(coordinate, feature.geometry)) return feature.properties.g;
++    for (let index = this.activeLevel.features.length - 1; index >= 0; index -= 1) {
++      const feature = this.activeLevel.features[index];
++      if (coordinate[0] < feature._bounds[0] || coordinate[0] > feature._bounds[2] ||
++          coordinate[1] < feature._bounds[1] || coordinate[1] > feature._bounds[3]) continue;
++      if (pointInGeometry(coordinate, feature.geometry)) return feature.properties.c;
+     }
+     return null;
+   }
+diff --git a/dist/index.html b/dist/index.html
+index 6b5e7ff..fcbf395 100644
+--- a/dist/index.html
++++ b/dist/index.html
+@@ -12,9 +12,9 @@
+     <link rel="stylesheet" href="./styles.css?v=3" />
+     <link rel="preload" href="./data/metadata.json" as="fetch" crossorigin />
+     <link rel="preload" href="./data/areas.json" as="fetch" crossorigin />
+-    <link rel="preload" href="./data/geojson/manifest.json" as="fetch" crossorigin />
+-    <link rel="preload" href="./data/geojson/overview.geojson" as="fetch" crossorigin />
+-    <script type="module" src="./app.js?v=7"></script>
++    <link rel="preload" href="./data/lod/manifest.json" as="fetch" crossorigin />
++    <link rel="preload" href="./data/lod/nacional.geojson.gz" as="fetch" crossorigin />
++    <script type="module" src="./app.js?v=8"></script>
+   </head>
+   <body>
+     <div class="app-shell">
+@@ -28,7 +28,7 @@
+           </div>
+           <div class="brand-copy">
+             <h1>Atlas das Áreas de Ponderação</h1>
+-            <p>Brasil · Censo Demográfico 2022</p>
++            <p>Brasil · Censo 2022 · GeoJSON multinível</p>
+           </div>
+         </div>
+         <div class="topbar-actions">
+@@ -116,7 +116,7 @@
+             <span id="loadingMessage">Carregando o mapa e o primeiro indicador…</span>
+           </div>
+           <div id="map"></div>
+-          <div class="map-base-note" id="mapBaseNote" role="status">Mapa-base: OSM</div>
++          <div class="map-base-note" id="mapBaseNote" role="status">Preparando detalhe nacional…</div>
+           <div class="map-badge" id="mapBadge" hidden>
+             <span class="map-badge-swatch"></span>
+             <span id="mapBadgeText"></span>
+@@ -185,7 +185,7 @@
+           <div><dt>Variáveis</dt><dd>305</dd></div>
+           <div><dt>Referência espacial</dt><dd>SIRGAS 2000</dd></div>
+         </dl>
+-        <p class="dialog-note">O mapa abre com uma visão nacional simplificada e carrega arquivos GeoJSON separados por UF conforme a aproximação. As 136 feições sem linha correspondente nas tabelas permanecem no mapa e são identificadas como “Sem dado”. O mapa-base Stamen Toner Lite é fornecido pela Stadia Maps.</p>
++        <p class="dialog-note">Esta versão alternativa usa três GeoJSON nacionais topologicamente contínuos. O nível de detalhe muda conforme a aproximação, sem recortes da malha por UF e sem ocultar a camada atual antes que a próxima esteja pronta. As 136 feições sem linha correspondente nas tabelas permanecem no mapa e são identificadas como “Sem dado”.</p>
+         <div class="dialog-actions">
+           <a class="button button-secondary" href="https://geoftp.ibge.gov.br/recortes_para_fins_estatisticos/malha_de_areas_de_ponderacao/censo_demografico_2022/APONDs2022_Geometrias/APONDs2022_Brasil.gpkg">Malha original do IBGE</a>
+           <button class="button button-primary" value="cancel">Voltar ao mapa</button>
+diff --git a/index.html b/index.html
+index af8c592..db18b9b 100644
+--- a/index.html
++++ b/index.html
+@@ -4,7 +4,7 @@
+     <meta charset="UTF-8" />
+     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+     <meta name="robots" content="noindex" />
+-    <title>Atlas das Áreas de Ponderação — Brasil</title>
++    <title>Atlas das Áreas de Ponderação — Brasil · GeoJSON</title>
+     <script>
+       const target = new URL("./dist/", window.location.href);
+       target.search = window.location.search;
