@@ -1,0 +1,100 @@
+name: Publish GeoJSON atlas
+
+on:
+  push:
+    paths:
+      - ".github/workflows/publish-pages.yml"
+      - "geojson-version.patch"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this project
+        uses: actions/checkout@v4
+
+      - name: Assemble the alternative source
+        run: |
+          git clone --no-checkout https://github.com/marceloreis/atlas-areas-ponderacao-brasil.git /tmp/atlas-source
+          git -C /tmp/atlas-source checkout bc9a51cb6e46fd1f106581d2da503784a4e16631
+          rsync -a --exclude=.git --exclude=.github /tmp/atlas-source/ ./
+          git apply geojson-version.patch
+          rm -rf dist/data/geojson
+          mkdir -p dist/data/lod
+          touch dist/.nojekyll
+
+      - name: Download official IBGE geometry
+        run: |
+          curl -L --fail --retry 3 -o /tmp/APONDs2022_Brasil.gpkg https://geoftp.ibge.gov.br/recortes_para_fins_estatisticos/malha_de_areas_de_ponderacao/censo_demografico_2022/APONDs2022_Geometrias/APONDs2022_Brasil.gpkg
+
+      - name: Install the pinned geometry processor
+        run: npm install --no-save --ignore-scripts mapshaper@0.7.61
+
+      - name: Generate topological GeoJSON levels
+        run: |
+          ./node_modules/.bin/mapshaper /tmp/APONDs2022_Brasil.gpkg -each 'c=cd_apond' -filter-fields c -simplify weighted 1.5% keep-shapes -o format=geojson precision=0.000001 dist/data/lod/nacional.geojson
+          ./node_modules/.bin/mapshaper /tmp/APONDs2022_Brasil.gpkg -each 'c=cd_apond' -filter-fields c -simplify weighted 5% keep-shapes -o format=geojson precision=0.000001 dist/data/lod/regional.geojson
+          ./node_modules/.bin/mapshaper /tmp/APONDs2022_Brasil.gpkg -each 'c=cd_apond' -filter-fields c -simplify weighted 13% keep-shapes -o format=geojson precision=0.000001 dist/data/lod/detalhado.geojson
+          gzip -9 -n dist/data/lod/nacional.geojson
+          gzip -9 -n dist/data/lod/regional.geojson
+          gzip -9 -n dist/data/lod/detalhado.geojson
+
+      - name: Write level manifest
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          manifest = {
+              "levels": [
+                  {"key": "nacional", "label": "Detalhe nacional", "file": "./data/lod/nacional.geojson.gz", "enterAt": 0},
+                  {"key": "regional", "label": "Detalhe regional", "file": "./data/lod/regional.geojson.gz", "enterAt": 4.8, "leaveBelow": 4.4},
+                  {"key": "detalhado", "label": "Detalhe local", "file": "./data/lod/detalhado.geojson.gz", "enterAt": 7.8, "leaveBelow": 7.4},
+              ]
+          }
+          Path("dist/data/lod/manifest.json").write_text(
+              json.dumps(manifest, ensure_ascii=False, separators=(",", ":")),
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Validate build
+        run: |
+          gzip -t dist/data/lod/nacional.geojson.gz
+          gzip -t dist/data/lod/regional.geojson.gz
+          gzip -t dist/data/lod/detalhado.geojson.gz
+          node --check dist/app.js
+          node --check dist/atlas-map.js
+          test -s dist/index.html
+          test -s dist/data/areas.json
+          test -s dist/data/metadata.json
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - name: Upload site
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
