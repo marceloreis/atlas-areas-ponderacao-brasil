@@ -1,5 +1,7 @@
 name: Publish GeoJSON atlas
 
+# Rebuilds the complete static atlas in a fresh workflow run.
+
 on:
   push:
     paths:
