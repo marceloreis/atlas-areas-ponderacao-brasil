@@ -26,6 +26,16 @@ jobs:
       - name: Assemble the alternative source
         run: |
           rsync -a source/ ./
+          published_base="https://marceloreis.github.io/atlas-areas-ponderacao-brasil"
+          for file in \
+            data/areas.json \
+            data/tables/Tab10_1.json \
+            data/tables/Tab11_1.json \
+            data/tables/Tab5_1.json \
+            data/tables/Tab9_1.json
+          do
+            curl -L --fail --retry 3 -o "dist/$file" "$published_base/$file"
+          done
           git apply geojson-version.patch
           rm -rf dist/data/geojson
           mkdir -p dist/data/lod
