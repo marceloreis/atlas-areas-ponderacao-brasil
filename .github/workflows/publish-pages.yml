@@ -25,7 +25,7 @@ jobs:
 
       - name: Assemble the alternative source
         run: |
-          git clone --no-checkout https://github.com/marceloreis/atlas-areas-ponderacao-brasil.git /tmp/atlas-source
+          git clone --no-checkout https://github.com/marceloreis/atlas-areas-ponderacao-brasil-tiles.git /tmp/atlas-source
           git -C /tmp/atlas-source checkout bc9a51cb6e46fd1f106581d2da503784a4e16631
           rsync -a --exclude=.git --exclude=.github /tmp/atlas-source/ ./
           git apply geojson-version.patch
